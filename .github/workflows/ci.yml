@@ -1,0 +1,41 @@
+name: CI
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      OMP_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.9"
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+      - name: Install locked dependencies with CPU PyTorch
+        run: |
+          uv export --locked --all-extras --no-hashes --no-emit-project --output-file /tmp/constraints.txt
+          uv pip install --torch-backend=cpu --constraint /tmp/constraints.txt --group dev --editable '.[all]'
+      - name: Check dependencies and run tests
+        run: |
+          uv pip check
+          python -m pytest -q
+      - name: Build distributions
+        run: uv build
+      - name: Audit locked dependencies
+        if: matrix.python-version == '3.11'
+        run: |
+          uv export --locked --all-extras --no-emit-project --output-file /tmp/audit-requirements.txt
+          uvx pip-audit==2.10.1 --require-hashes --no-deps --disable-pip -r /tmp/audit-requirements.txt

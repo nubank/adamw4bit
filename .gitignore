@@ -1,0 +1,31 @@
+# UV virtual environment
+.venv/
+.artifact-venv/
+.python-version.bak
+
+# Python cache
+__pycache__/
+.cache/
+.pytest_cache/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local environment and credentials
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+outputs/

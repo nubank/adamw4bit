@@ -1,0 +1,39 @@
+[project]
+name = "adamw4bit"
+version = "0.1.0"
+description = "Packed 4-bit AdamW optimizer state with ZE-EDEN and ZIP-SR"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.13,<3",
+]
+
+[project.optional-dependencies]
+all = [
+    "accelerate>=1.15,<2",
+    "datasets>=5.0.1,<6",
+    "transformers>=5.10,<6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3,<10",
+    "transformers>=5.10,<6",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["adamw4bit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[build-system]
+requires = ["setuptools>=83"]
+build-backend = "setuptools.build_meta"

@@ -128,6 +128,11 @@ Run from the repository root after `pip install '.[all]'`. Each script accepts
 uv sync
 uv run pytest
 ```
+## Status
+Security fixes are provided for the
+latest release, as described in [`SECURITY.md`](SECURITY.md). Questions and
+non-security bugs belong in GitHub issues. The project is maintained by
+[Nubank](https://nubank.com.br).
 
 ## License
 

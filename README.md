@@ -64,6 +64,40 @@ parameter, so use untied weights for a head-only switch. The examples below
 keep first-moment RTN throughout and demonstrate the quantization settings;
 they do not implement the full paper training protocol.
 
+## Optional memory optimization
+
+The reference implementation remains the default. Enable the bounded-workspace
+backend explicitly:
+
+```python
+optimizer = ZEEDENAdamW4Bit(model.parameters(), optimized=True)
+# ZIPSRAdamW4Bit and QuantizedAdamW accept the same flag.
+```
+
+For supported contiguous tensors, the backend updates packed moments in place
+and processes temporary FP32 values in chunks of at most 1,048,576 elements.
+Chunk boundaries preserve quantization blocks and packed-code boundaries.
+Persistent moments, parameters, and gradients still scale with model size.
+CPU uses PyTorch operations; supported FP32 CUDA rounding is compiled lazily
+with `torch.compile`, so the first update includes compilation time.
+
+Eight-bit schemes, noncontiguous tensors, telemetry, recorded diagnostics,
+optimizer-level update clipping, unsupported research read variants, and
+incompatible or overlapping state storage use the reference update. Those fallbacks can require full-tensor
+workspace. Ordinary gradient clipping before `optimizer.step()` is unaffected.
+
+This option prioritizes peak optimizer memory. The current chunked implementation
+can be slower than the reference, and optimizer memory savings may not reduce a
+training peak dominated by activations. Measure both memory and time on your
+workload; see [the benchmark commands](benchmarks/README.md).
+
+Chunking and compiled arithmetic can change floating-point results and stochastic
+rounding samples. Resume with the same `optimized` setting and quantization seed;
+use matching settings across distributed replicas. Optimized checkpoints retain
+their chunk and fallback policy. A reference checkpoint loaded with
+`optimized=True` adopts the current chunk limit. With `quant_rng_seed=None`, also
+save and restore the global PyTorch RNG state as part of the training checkpoint.
+
 ## Checkpoints
 
 Save optimizer state alongside model state. New optimizer checkpoints load with

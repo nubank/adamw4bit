@@ -1,3 +1,4 @@
 recursive-include examples *.py *.sh *.md
 recursive-include tests *.py
 include uv.lock
+recursive-include benchmarks *.py *.md

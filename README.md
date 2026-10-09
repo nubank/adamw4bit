@@ -89,7 +89,7 @@ workspace. Ordinary gradient clipping before `optimizer.step()` is unaffected.
 This option prioritizes peak optimizer memory. The current chunked implementation
 can be slower than the reference, and optimizer memory savings may not reduce a
 training peak dominated by activations. Measure both memory and time on your
-workload; see [the benchmark commands](benchmarks/README.md).
+workload.
 
 Chunking and compiled arithmetic can change floating-point results and stochastic
 rounding samples. Resume with the same `optimized` setting and quantization seed;

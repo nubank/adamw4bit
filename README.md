@@ -74,29 +74,39 @@ optimizer = ZEEDENAdamW4Bit(model.parameters(), optimized=True)
 # ZIPSRAdamW4Bit and QuantizedAdamW accept the same flag.
 ```
 
-For supported contiguous tensors, the backend updates packed moments in place
-and processes temporary FP32 values in chunks of at most 1,048,576 elements.
-Chunk boundaries preserve quantization blocks and packed-code boundaries.
+For supported contiguous tensors, the backend updates packed moments in place.
+New optimized instances use a default working chunk of 512 Ki elements (524,288),
+rounded down as needed to preserve quantization blocks and packed-code boundaries.
 Persistent moments, parameters, and gradients still scale with model size.
-CPU uses PyTorch operations; supported FP32 CUDA rounding is compiled lazily
-with `torch.compile`, so the first update includes compilation time.
+
+CPU uses the shared eager chunk update. For FP32 CUDA parameters, `torch.compile`
+compiles that same update, including moment decoding, AdamW arithmetic, and
+encoding. Stochastic rounding draws remain eager and use the optimizer's existing
+generators. Other supported parameter dtypes use the eager chunk update.
+
+Compilation is lazy. The first call for a new configuration can take substantially
+longer and temporarily use more GPU memory than warmed updates. Measure cold and
+warmed peaks and timings separately; warmed optimizer measurements do not describe
+the complete training peak.
 
 Eight-bit schemes, noncontiguous tensors, telemetry, recorded diagnostics,
-optimizer-level update clipping, unsupported research read variants, and
-incompatible or overlapping state storage use the reference update. Those fallbacks can require full-tensor
-workspace. Ordinary gradient clipping before `optimizer.step()` is unaffected.
+optimizer-level update clipping, unsupported research read variants, overlapping
+parameter/gradient buffers, and incompatible or overlapping moment storage use
+the reference update. Those fallbacks can require full-tensor workspace.
+Ordinary gradient clipping before `optimizer.step()` is unaffected.
 
-This option prioritizes peak optimizer memory. The current chunked implementation
-can be slower than the reference, and optimizer memory savings may not reduce a
-training peak dominated by activations. Measure both memory and time on your
-workload.
+This backend remains experimental and can be slower than the reference. Chunking
+and compiled arithmetic can change floating-point results and stochastic rounding
+samples. Validate training quality, peak memory, and speed on your workload;
+optimizer memory savings may not reduce a training peak dominated by activations.
 
-Chunking and compiled arithmetic can change floating-point results and stochastic
-rounding samples. Resume with the same `optimized` setting and quantization seed;
-use matching settings across distributed replicas. Optimized checkpoints retain
-their chunk and fallback policy. A reference checkpoint loaded with
-`optimized=True` adopts the current chunk limit. With `quant_rng_seed=None`, also
-save and restore the global PyTorch RNG state as part of the training checkpoint.
+Resume with the same `optimized` setting and quantization seed, and use matching
+settings across distributed replicas. Optimized checkpoints retain their saved
+chunk limit and fallback policy, including older 1,048,576-element limits. Loading
+a checkpoint without a saved chunk limit with `optimized=True` adopts the current
+512 Ki-element default. The constructor's `optimized` flag must still be selected
+when recreating the optimizer. With `quant_rng_seed=None`, also save and restore
+the global PyTorch RNG state as part of the training checkpoint.
 
 ## Checkpoints
 

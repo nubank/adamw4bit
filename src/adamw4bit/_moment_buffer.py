@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from adamw4bit.quantization import QuantState, pack_4bit_codes
-from adamw4bit._optimized_quantization import dequantize, quantize
+from adamw4bit._optimized_quantization import _codebook, dequantize, quantize
 
 
 def tensor_byte_range(tensor: torch.Tensor) -> tuple[str, int, int]:
@@ -43,11 +43,10 @@ def moment_tensors(state: dict[str, Any]) -> list[torch.Tensor]:
 
 @dataclass
 class MomentBuffer:
-    """A real moment buffer, not a replacement parameter or optimizer state."""
+    """A view of persistent FP32 values or packed codes and block scales."""
 
     scheme: str
     block_size: int
-    shape: torch.Size
     values: torch.Tensor | None = None
     codes: torch.Tensor | None = None
     quant_state: QuantState | None = None
@@ -102,8 +101,10 @@ class MomentBuffer:
                 state[key] = torch.zeros(shape, device=device, dtype=torch.float32)
                 state.pop(f"{key}_code", None)
                 state.pop(f"{key}_quant_state", None)
-            return cls(scheme, block_size, shape, values=state[key].view(-1))
+            return cls(scheme, block_size, values=state[key].view(-1))
 
+        # Populate per-device caches before tracing, including an NF4/SR switch.
+        _codebook(scheme, device)
         if initialize:
             # Even tile size is important when a caller selects an odd block
             # size: repeating separately packed odd blocks inserts pad nibbles.
@@ -138,29 +139,41 @@ class MomentBuffer:
                 state[f"{key}_code"] = codes
             # Older checkpoints may have compact storage but lack this flag.
             meta.packed = True
-        return cls(scheme, block_size, shape, codes=codes.view(-1), quant_state=meta)
+        return cls(scheme, block_size, codes=codes.view(-1), quant_state=meta)
 
-    def read(self, start: int, stop: int) -> torch.Tensor:
+    def chunk_view(self, start: int, stop: int) -> "MomentBuffer":
+        """View an aligned chunk with local offsets and shared persistent storage."""
+        shape = torch.Size((stop - start,))
         if self.values is not None:
-            return self.values[start:stop]
+            return MomentBuffer(self.scheme, self.block_size,
+                                values=self.values[start:stop].detach())
         assert self.codes is not None and self.quant_state is not None
-        scales = self.quant_state.absmax[start // self.block_size:stop // self.block_size]
-        chunk_meta = QuantState(absmax=scales, shape=torch.Size((stop - start,)),
-                                dtype=torch.float32, blocksize=self.block_size, packed=True)
-        return dequantize(self.codes[start // 2:(stop + 1) // 2], chunk_meta, mode=self.scheme)
+        scales = self.quant_state.absmax[start // self.block_size:stop // self.block_size].detach()
+        meta = QuantState(absmax=scales, shape=shape, dtype=self.quant_state.dtype,
+                          blocksize=self.block_size, packed=True)
+        return MomentBuffer(self.scheme, self.block_size,
+                            codes=self.codes[start // 2:(stop + 1) // 2].detach(), quant_state=meta)
+
+    def read(self) -> torch.Tensor:
+        """Decode this view into FP32 working values."""
+        if self.values is not None:
+            return self.values
+        assert self.codes is not None and self.quant_state is not None
+        return dequantize(self.codes, self.quant_state, mode=self.scheme)
 
     def write(
-        self, start: int, stop: int, value: torch.Tensor, *, eden: bool = False,
-        generator: torch.Generator | None = None, bias_correction: float | None = None,
-        eps: float | None = None,
+        self, value: torch.Tensor, *, eden: bool = False,
+        generator: torch.Generator | None = None, bias_correction: float | torch.Tensor | None = None,
+        eps: float | None = None, draws: torch.Tensor | None = None,
     ) -> None:
+        """Encode working values back into this view's persistent storage."""
         if self.values is not None:
-            self.values[start:stop].copy_(value)
+            self.values.copy_(value)
             return
         assert self.codes is not None and self.quant_state is not None
         codes, meta = quantize(
             value, block_size=self.block_size, mode=self.scheme, eden_correction=eden,
-            generator=generator, bias_correction=bias_correction, eps=eps,
+            generator=generator, bias_correction=bias_correction, eps=eps, draws=draws,
         )
-        self.codes[start // 2:(stop + 1) // 2].copy_(pack_4bit_codes(codes))
-        self.quant_state.absmax[start // self.block_size:stop // self.block_size].copy_(meta.absmax)
+        self.codes.copy_(pack_4bit_codes(codes))
+        self.quant_state.absmax.copy_(meta.absmax)

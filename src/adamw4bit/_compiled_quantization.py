@@ -1,9 +1,10 @@
 """Shared rounding contracts and deterministic CUDA quantization kernels.
 
-Random draws, normalization, and EDEN reductions stay in the eager caller.
-Compiled functions return only codes, so intermediate values can be fused away.
-Exact-level guards are shared with eager strategies, including when adjacent
-preconditioners coincide in FP32.
+Callers supply normalized values and any random draws. Normalization and EDEN
+scale corrections belong to the caller and can run eagerly or within a compiled
+chunk update. The shared rounding functions return codes and can be compiled on
+their own or inlined into that update. Exact-level guards are shared with eager
+strategies, including when adjacent preconditioners coincide in FP32.
 """
 
 from functools import lru_cache

@@ -1,9 +1,11 @@
 """Bounded-chunk codecs used only by the opt-in optimizer backend.
 
-Codebooks, packed layout and scale metadata come from the reference module.
-Normalization and EDEN reductions remain eager; CUDA compiles only the pure
-rounding formulas. Uniform draws stay outside compilation and use the optimizer's
-checkpointed generators. Exact-level guards are shared by CPU and CUDA paths.
+Codebooks, packed layout, and scale metadata come from the reference module.
+The same decode, normalization, rounding, and EDEN formulas serve eager updates
+and the shared compiled CUDA chunk update. Standalone supported CUDA rounding
+uses the cached rounding kernels. Uniform draws stay eager and use the
+optimizer's checkpointed generators; chunk writes can pass pre-drawn uniforms.
+Exact-level guards are shared by CPU and CUDA paths.
 """
 
 import torch
@@ -32,28 +34,43 @@ def _lookup(codebook: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
     return torch.index_select(codebook, 0, codes.reshape(-1).to(torch.int32)).reshape(codes.shape)
 
 
+@torch.compiler.disable
+def _uniform_draws(
+    value: torch.Tensor, generator: torch.Generator | None, *, block_size: int,
+) -> torch.Tensor:
+    """Keep checkpointed random draws outside compiled graphs."""
+    shape = ((value.numel() + block_size - 1) // block_size, block_size)
+    return torch.rand(shape, device=value.device, dtype=value.dtype, generator=generator)
+
+
 def quantize(
     value: torch.Tensor, block_size: int, mode: str, *, eden_correction: bool = False,
-    generator: torch.Generator | None = None, bias_correction: float | None = None,
-    eps: float | None = None,
+    generator: torch.Generator | None = None, bias_correction: float | torch.Tensor | None = None,
+    eps: float | None = None, draws: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, QuantState]:
     """Encode an FP32 working chunk with the original normalized formulas."""
     assert value.dtype == torch.float32
     blocked, shape = _block(value, block_size)
     scales = blocked.abs().max(dim=1).values.clamp_min_(default_min_scale(mode))
     scaled = blocked / scales.unsqueeze(1)
+    if draws is not None and (
+        draws.shape != scaled.shape or draws.dtype != scaled.dtype or draws.device != scaled.device
+    ):
+        raise ValueError("Pre-drawn uniforms must match the normalized block shape, dtype and device")
     codebook = _codebook(mode, value.device)
     strategy = _STRATEGIES[mode]
-    use_compile = rounding.supported(scaled, codebook)
+    use_compile = not torch.compiler.is_compiling() and rounding.supported(scaled, codebook)
     if isinstance(strategy, _UpdateUnbiasedStochasticCodebookQuantizationStrategy):
-        draws = torch.rand(scaled.shape, device=scaled.device, dtype=scaled.dtype, generator=generator)
-        bias = torch.tensor(max(bias_correction if bias_correction is not None else 1.0, 1e-12),
-                            dtype=torch.float64)
-        epsilon = torch.tensor(eps if eps is not None else 1e-8, dtype=torch.float64)
+        if draws is None:
+            draws = _uniform_draws(scaled, generator, block_size=block_size)
+        bias = torch.as_tensor(bias_correction if bias_correction is not None else 1.0,
+                               dtype=torch.float64, device="cpu").clamp_min(1e-12)
+        epsilon = torch.as_tensor(eps if eps is not None else 1e-8, dtype=torch.float64, device="cpu")
         function = rounding.kernel("update_sr") if use_compile else rounding._update_sr
         codes = function(scaled, codebook, scales, draws, bias, epsilon)
     elif isinstance(strategy, _StochasticCodebookQuantizationStrategy):
-        draws = torch.rand(scaled.shape, device=scaled.device, dtype=scaled.dtype, generator=generator)
+        if draws is None:
+            draws = _uniform_draws(scaled, generator, block_size=block_size)
         function = rounding.kernel("state_sr") if use_compile else rounding._state_sr
         codes = function(scaled, codebook, draws)
     else:
@@ -77,8 +94,8 @@ def dequantize(codes: torch.Tensor, quant_state: QuantState, mode: str) -> torch
     if getattr(quant_state, "packed", False):
         packed = codes.reshape(-1)
         unpacked = torch.empty(count, device=codes.device, dtype=torch.uint8)
-        torch.bitwise_and(packed, 0x0F, out=unpacked[0::2])
-        torch.bitwise_right_shift(packed[:count // 2], 4, out=unpacked[1::2])
+        unpacked[0::2] = torch.bitwise_and(packed, 0x0F)
+        unpacked[1::2] = torch.bitwise_right_shift(packed[:count // 2], 4)
         codes = unpacked
     blocked, _ = _block(codes, quant_state.blocksize)
     values = _lookup(_codebook(mode, codes.device), blocked)

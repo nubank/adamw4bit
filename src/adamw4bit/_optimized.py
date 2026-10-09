@@ -5,18 +5,32 @@ Only ordinary AdamW reads are supported here; research read-side variants,
 callbacks, clipping and unusual tensor layouts run the reference implementation.
 """
 
+from collections.abc import Callable
+from functools import lru_cache
 import math
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from adamw4bit._moment_buffer import MomentBuffer, moment_tensors, overlaps, tensor_byte_range
-from adamw4bit.quantization import default_block_size
+from adamw4bit._optimized_quantization import _uniform_draws
+from adamw4bit.quantization import (
+    _STRATEGIES,
+    _StochasticCodebookQuantizationStrategy,
+    _UpdateUnbiasedStochasticCodebookQuantizationStrategy,
+    default_block_size,
+)
 
 if TYPE_CHECKING:
     from adamw4bit.adamw import QuantizedAdamW
 
-_CHUNK_NUMEL = 1 << 20
+_Scalar = float | torch.Tensor
+_STOCHASTIC_STRATEGIES = (
+    _StochasticCodebookQuantizationStrategy,
+    _UpdateUnbiasedStochasticCodebookQuantizationStrategy,
+)
+
+_CHUNK_NUMEL = 1 << 19
 _CHUNK_KEY = "max_chunk_numel"
 _FALLBACK_KEY = "_optimized_full_fallback"
 _M1_SCHEMES = {"fp32", "nf4", "nf4_sr", "sdyn4", "sdyn4_sr"}
@@ -94,6 +108,9 @@ class OptimizedBackend:
             if not MomentBuffer.compatible(state, key, scheme, size, parameter.shape, parameter.device):
                 return None
         occupied = [tensor_byte_range(parameter), tensor_byte_range(gradient)]
+        if overlaps(occupied[0], occupied[1]):
+            # A chunk update must not change gradients used by later chunks.
+            return None
         for tensor in moment_tensors(state):
             region = tensor_byte_range(tensor)
             if any(overlaps(region, previous) for previous in occupied):
@@ -150,34 +167,63 @@ class OptimizedBackend:
         )
         state["step"] = state.get("step", 0) + 1
         beta1, beta2 = group["betas"]
-        bias = (1 - beta1 ** state["step"], 1 - beta2 ** state["step"])
-        storage_bias = 1 - beta2 ** (state["step"] + 1) if schemes[1] in _NEXT_BIAS_SCHEMES else bias[1]
+        bias: tuple[_Scalar, _Scalar] = (1 - beta1 ** state["step"], 1 - beta2 ** state["step"])
+        storage_bias: _Scalar = 1 - beta2 ** (state["step"] + 1) if schemes[1] in _NEXT_BIAS_SCHEMES else bias[1]
         flat_parameter, flat_gradient = parameter.data.view(-1), gradient.view(-1)
+        lr: _Scalar = group["lr"]
+        step_chunk = _step_chunk
+        use_compile = parameter.is_cuda and parameter.dtype == torch.float32
+        if use_compile:
+            # Step-dependent values remain inputs rather than graph constants.
+            bias = (torch.as_tensor(bias[0], dtype=torch.float64, device="cpu"),
+                    torch.as_tensor(bias[1], dtype=torch.float64, device="cpu"))
+            storage_bias = torch.as_tensor(storage_bias, dtype=torch.float64, device="cpu")
+            lr = torch.as_tensor(lr, dtype=torch.float64, device="cpu")
+            step_chunk = _compiled_step_chunk(schemes[0], schemes[1], group["use_eden_m2"], parameter.device)
         for start in range(0, parameter.numel(), chunk_size):
             stop = min(start + chunk_size, parameter.numel())
-            _step_chunk(
-                flat_parameter[start:stop], flat_gradient[start:stop], first, second, start, stop,
+            step_chunk(
+                flat_parameter[start:stop].detach(), flat_gradient[start:stop].detach(),
+                first.chunk_view(start, stop), second.chunk_view(start, stop),
                 betas=(beta1, beta2), bias=bias, storage_bias=storage_bias,
-                lr=group["lr"], weight_decay=group["weight_decay"], eps=group["eps"],
+                lr=lr, weight_decay=group["weight_decay"], eps=group["eps"],
                 eden=group["use_eden_m2"], generators=generators,
             )
 
 
 def _step_chunk(
     parameter: torch.Tensor, gradient: torch.Tensor,
-    first: MomentBuffer, second: MomentBuffer, start: int, stop: int,
-    *, betas: tuple[float, float], bias: tuple[float, float], storage_bias: float,
-    lr: float, weight_decay: float, eps: float, eden: bool,
+    first: MomentBuffer, second: MomentBuffer,
+    *, betas: tuple[float, float], bias: tuple[_Scalar, _Scalar], storage_bias: _Scalar,
+    lr: _Scalar, weight_decay: float, eps: float, eden: bool,
     generators: tuple[torch.Generator | None, torch.Generator | None],
 ) -> None:
     # Separate frame: scratch from this chunk dies before the next decode.
     g = gradient.to(dtype=torch.float32)
-    m1, m2 = first.read(start, stop), second.read(start, stop)
+    m1, m2 = first.read(), second.read()
     m1.lerp_(g, 1 - betas[0])
     m2.lerp_(g.square(), 1 - betas[1])
-    denominator = m2.sqrt().div_(math.sqrt(bias[1])).add_(eps)
+    bias_sqrt = bias[1].sqrt() if isinstance(bias[1], torch.Tensor) else math.sqrt(bias[1])
+    denominator = m2.sqrt().div_(bias_sqrt).add_(eps)
     parameter.mul_(1 - lr * weight_decay)
     parameter.addcdiv_(m1, denominator, value=-lr / bias[0])
-    first.write(start, stop, m1, generator=generators[0])
-    second.write(start, stop, m2, eden=eden, generator=generators[1],
-                 bias_correction=storage_bias, eps=eps)
+    # Release update scratch before allocating quantization intermediates.
+    del g, denominator
+    draws = None
+    if isinstance(_STRATEGIES.get(first.scheme), _STOCHASTIC_STRATEGIES):
+        draws = _uniform_draws(m1, generators[0], block_size=first.block_size)
+    first.write(m1, generator=generators[0], draws=draws)
+    del m1, draws
+    draws = None
+    if isinstance(_STRATEGIES.get(second.scheme), _STOCHASTIC_STRATEGIES):
+        draws = _uniform_draws(m2, generators[1], block_size=second.block_size)
+    second.write(m2, eden=eden, generator=generators[1],
+                 bias_correction=storage_bias, eps=eps, draws=draws)
+
+
+@lru_cache(maxsize=None)
+def _compiled_step_chunk(
+    m1_scheme: str, m2_scheme: str, eden: bool, device: torch.device,
+) -> Callable[..., None]:
+    """Use the arguments as cache keys to isolate each scheme/device configuration."""
+    return torch.compile(_step_chunk, dynamic=True, isolate_recompiles=True)

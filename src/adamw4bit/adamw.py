@@ -72,6 +72,8 @@ class QuantizedAdamW(Optimizer):
             Defaults to quant_scheme.
         m2_quant_scheme: Override scheme for the second moment m2. "fp32" keeps m2 unquantized.
             Defaults to quant_scheme. (Used for isolation studies, e.g. m1=fp32, m2=lin4.)
+        optimized: Opt into bounded-workspace updates and compiled CUDA rounding.
+            Unsupported configurations use the unchanged reference step.
         quant_rng_seed: Optional base seed for independent, checkpointed m1
             and m2 quantization generators. None preserves the legacy shared
             global RNG stream.
@@ -139,7 +141,8 @@ class QuantizedAdamW(Optimizer):
                  update_norm_clip: float | None = None,
                  record_update_direction_every: int | None = None,
                  record_preconditioner_every: int | None = None,
-                 record_preconditioner_steps: tuple[int, ...] | list[int] | set[int] | None = None):
+                 record_preconditioner_steps: tuple[int, ...] | list[int] | set[int] | None = None,
+                 optimized: bool = False):
 
 
         if not 0.0 <= lr:
@@ -229,6 +232,11 @@ class QuantizedAdamW(Optimizer):
         self._last_update_directions: dict[torch.Tensor, tuple[int, torch.Tensor]] = {}
         self._last_preconditioners: dict[torch.Tensor, tuple[int, torch.Tensor]] = {}
         self._last_effective_preconditioners: dict[torch.Tensor, tuple[int, torch.Tensor]] = {}
+        self._optimized = optimized
+        if optimized:
+            from adamw4bit._optimized import OptimizedBackend
+
+            self._optimized_backend = OptimizedBackend(self)
 
     def _m1_scheme_for(
         self,
@@ -488,6 +496,9 @@ class QuantizedAdamW(Optimizer):
 
             for p in group["params"]:
                 if p.grad is None:
+                    continue
+
+                if self._optimized and self._optimized_backend.try_step_parameter(self, p, group):
                     continue
 
                 # Optimizer math and any TorchAO-ineligible fallback state stay

@@ -173,6 +173,11 @@ class OptimizedBackend:
         lr: _Scalar = group["lr"]
         step_chunk = _step_chunk
         use_compile = parameter.is_cuda and parameter.dtype == torch.float32
+        pre_draw_second = (
+            use_compile and not group["use_eden_m2"]
+            and not isinstance(_STRATEGIES.get(schemes[0]), _STOCHASTIC_STRATEGIES)
+            and isinstance(_STRATEGIES.get(schemes[1]), _STOCHASTIC_STRATEGIES)
+        )
         if use_compile:
             # Step-dependent values remain inputs rather than graph constants.
             bias = (torch.as_tensor(bias[0], dtype=torch.float64, device="cpu"),
@@ -182,13 +187,20 @@ class OptimizedBackend:
             step_chunk = _compiled_step_chunk(schemes[0], schemes[1], group["use_eden_m2"], parameter.device)
         for start in range(0, parameter.numel(), chunk_size):
             stop = min(start + chunk_size, parameter.numel())
+            parameter_view = flat_parameter[start:stop].detach()
+            # Limit early draws to m2 to bound their overlap with compilation scratch.
+            second_draws = (
+                _uniform_draws(parameter_view, generators[1], block_size=sizes[1])
+                if pre_draw_second else None
+            )
             step_chunk(
-                flat_parameter[start:stop].detach(), flat_gradient[start:stop].detach(),
+                parameter_view, flat_gradient[start:stop].detach(),
                 first.chunk_view(start, stop), second.chunk_view(start, stop),
                 betas=(beta1, beta2), bias=bias, storage_bias=storage_bias,
                 lr=lr, weight_decay=group["weight_decay"], eps=group["eps"],
-                eden=group["use_eden_m2"], generators=generators,
+                eden=group["use_eden_m2"], generators=generators, second_draws=second_draws,
             )
+            del second_draws  # Free these draws before allocating the next chunk.
 
 
 def _step_chunk(
@@ -197,6 +209,7 @@ def _step_chunk(
     *, betas: tuple[float, float], bias: tuple[_Scalar, _Scalar], storage_bias: _Scalar,
     lr: _Scalar, weight_decay: float, eps: float, eden: bool,
     generators: tuple[torch.Generator | None, torch.Generator | None],
+    second_draws: torch.Tensor | None = None,
 ) -> None:
     # Separate frame: scratch from this chunk dies before the next decode.
     g = gradient.to(dtype=torch.float32)
@@ -214,8 +227,8 @@ def _step_chunk(
         draws = _uniform_draws(m1, generators[0], block_size=first.block_size)
     first.write(m1, generator=generators[0], draws=draws)
     del m1, draws
-    draws = None
-    if isinstance(_STRATEGIES.get(second.scheme), _STOCHASTIC_STRATEGIES):
+    draws = second_draws
+    if draws is None and isinstance(_STRATEGIES.get(second.scheme), _STOCHASTIC_STRATEGIES):
         draws = _uniform_draws(m2, generators[1], block_size=second.block_size)
     second.write(m2, eden=eden, generator=generators[1],
                  bias_correction=storage_bias, eps=eps, draws=draws)
@@ -226,4 +239,9 @@ def _compiled_step_chunk(
     m1_scheme: str, m2_scheme: str, eden: bool, device: torch.device,
 ) -> Callable[..., None]:
     """Use the arguments as cache keys to isolate each scheme/device configuration."""
-    return torch.compile(_step_chunk, dynamic=True, isolate_recompiles=True)
+    # Limit reduction-autotuning scratch for non-EDEN updates.
+    # EDEN inherits the existing deterministic compiler setting.
+    return torch.compile(
+        _step_chunk, isolate_recompiles=True,
+        options={"deterministic": True} if not eden else None,
+    )

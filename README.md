@@ -81,8 +81,12 @@ Persistent moments, parameters, and gradients still scale with model size.
 
 CPU uses the shared eager chunk update. For FP32 CUDA parameters, `torch.compile`
 compiles that same update, including moment decoding, AdamW arithmetic, and
-encoding. Stochastic rounding draws remain eager and use the optimizer's existing
-generators. Other supported parameter dtypes use the eager chunk update.
+encoding. Stochastic rounding keeps the optimizer's existing generators. For
+non-EDEN FP32 CUDA updates where only the second moment uses stochastic rounding,
+its draws are prepared eagerly before the compiled chunk. This removes a graph
+break. Other configurations retain their existing draw schedule to limit peak
+memory. Non-EDEN reductions use deterministic kernel selection to limit startup
+autotuning memory. Other supported parameter dtypes use the eager chunk update.
 
 Compilation is lazy. The first call for a new configuration can take substantially
 longer and temporarily use more GPU memory than warmed updates. Measure cold and
@@ -105,7 +109,9 @@ settings across distributed replicas. Optimized checkpoints retain their saved
 chunk limit and fallback policy, including older 1,048,576-element limits. Loading
 a checkpoint without a saved chunk limit with `optimized=True` adopts the current
 512 Ki-element default. The constructor's `optimized` flag must still be selected
-when recreating the optimizer. With `quant_rng_seed=None`, also save and restore
+when recreating the optimizer. Reapply any per-parameter first-moment scheme
+overrides with `set_m1_quant_scheme_for_parameters`; these overrides are not saved
+in the optimizer checkpoint. With `quant_rng_seed=None`, also save and restore
 the global PyTorch RNG state as part of the training checkpoint.
 
 ## Checkpoints
